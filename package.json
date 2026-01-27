@@ -1,0 +1,19 @@
+{
+  "name": "grokini-trading-bot",
+  "version": "3.0.0",
+  "description": "Ultimate Solana Telegram Trading Bot",
+  "main": "snipe.js",
+  "scripts": {
+    "start": "node snipe.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.3",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^2.7.0",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
