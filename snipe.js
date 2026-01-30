@@ -1536,7 +1536,7 @@ bot.catch((err, ctx) => {
 // START BOT
 // ============================================
 bot.launch().then(() => {
-  console.log('🚀 Grokini Trading Bot is running!');
+  console.log('🚀 WTF SNIPE X Bot is running!');
   console.log('👤 Admin notifications:', ADMIN_CHAT_ID ? 'Enabled' : 'Disabled');
 });
 
