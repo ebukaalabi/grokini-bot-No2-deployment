@@ -2189,3 +2189,10 @@ process.once('SIGTERM', () => {
   bot.stop('SIGTERM');
 });
 
+// ============ LAUNCH BOT ============
+bot.launch()
+  .then(() => console.log('🤖 WTF Snipe X Bot is running!'))
+  .catch(err => console.error('Failed to start bot:', err));
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
