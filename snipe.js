@@ -852,18 +852,18 @@ async function showMainMenu(ctx, edit = false) {
     : '⚠️ No wallet connected';
   
   const message = `
-🚀 *Hey Chad* *Welcome to Maestro Sniper Bot* 🤖
+🚀 *Hey Welcome to Maestro Sniper Bot* 🤖
 
-*I'm your Web3 execution engine*.
-AI-driven. Battle-tested. Locked down.
-━━━━━━━━━━━━━━━━━━
-*What I do for you*:⬇️
-📊 Scan the market to tell you what to buy, ignore, or stalk
-🎯 Execute entries & exits with sniper-level timing
-🧠 Detect traps, fake pumps, and incoming dumps before they hit
-⚡ Operate at machine-speed — no lag, no emotion
-🔒 Secured with Bitcoin-grade architecture
-🚀 Track price action past your take-profit so winners keep running 🏃 
+
+I’m the one-stop solution for all your trading needs!
+
+🔗 Chains: Enable/disable chains.
+💳 Wallets: Import or generate wallets.
+⚙️ Global Settings: Customize the bot for a unique experience.
+🕓 Active Orders: Active buy and sell limit orders.
+📈 Positions: Monitor your active trades.
+
+⚡ Looking for a quick buy or sell? Simply paste the token CA and you're ready to go!🏃 
 ━━━━━━━━━━━━━━━━━━
 ${walletInfo}
 
